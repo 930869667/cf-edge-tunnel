@@ -107,6 +107,19 @@ async function vlessOverWSHandler(request, userId, proxyIp, proxyPort) {
   let udpStreamWrite = null;
   let isDns = false;
 
+  const closeRemoteSocket = () => {
+    const socket = remoteSocketWrapper.value;
+    if (!socket) {
+      return;
+    }
+    remoteSocketWrapper.value = null;
+    try {
+      socket.close();
+    } catch (err) {
+      log("close remote socket error", err);
+    }
+  };
+
   // ws --> remote
   readableWebSocketStream
     .pipeTo(
@@ -163,7 +176,7 @@ async function vlessOverWSHandler(request, userId, proxyIp, proxyPort) {
             udpStreamWrite(rawClientData);
             return;
           }
-          handleTCPOutBound(
+          await handleTCPOutBound(
             remoteSocketWrapper,
             addressRemote,
             portRemote,
@@ -176,15 +189,18 @@ async function vlessOverWSHandler(request, userId, proxyIp, proxyPort) {
           );
         },
         close() {
-          log(`readableWebSocketStream is close`);
+          log("readableWebSocketStream is close (peer close ws input stream)");
+          closeRemoteSocket();
         },
         abort(reason) {
-          log(`readableWebSocketStream is abort`, JSON.stringify(reason));
+          log("readableWebSocketStream is abort", JSON.stringify(reason));
+          closeRemoteSocket();
         },
       }),
     )
     .catch((err) => {
       log("readableWebSocketStream pipeTo error", err);
+      closeRemoteSocket();
     });
 
   return new Response(null, {
@@ -304,9 +320,12 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
       // The event means that the client closed the client -> server stream.
       // However, the server -> client stream is still open until you call close() on the server side.
       // The WebSocket protocol says that a separate close message must be sent in each direction to fully close the socket.
-      webSocketServer.addEventListener("close", () => {
+      webSocketServer.addEventListener("close", (event) => {
         // client send close, need close server
         // if stream is cancel, skip controller.close
+        log(
+          `websocket close event code=${event.code}, clean=${event.wasClean}, reason=${event.reason || ""}`,
+        );
         safeCloseWebSocket(webSocketServer);
         if (readableStreamCancel) {
           return;
@@ -318,7 +337,11 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
         controller.error(err);
       });
       // for ws 0rtt
-      const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
+      // Some client may send multiple Sec-WebSocket-Protocol tokens
+      // Try the first non empty token as early data plaload
+      const { earlyData, error } = base64ToArrayBuffer(
+        earlyDataHeader.split(",")[0]?.trim() || "",
+      );
       if (error) {
         controller.error(error);
       } else if (earlyData) {
@@ -475,8 +498,20 @@ function processVlessHeader(vlessBuffer, userId) {
       break;
     case 3:
       addressLength = 16;
+      if (buffer.byteLength < addressValueIndex + addressLength) {
+        return {
+          hasError: true,
+          message: "invalid data: ipv6 address out of range",
+        };
+      }
+      const ipv6Buffer = buffer.slice(
+        addressValueIndex,
+        addressValueIndex + addressLength,
+      );
       const dataView = new DataView(
-        buffer.slice(addressValueIndex, addressValueIndex + addressLength),
+        ipv6Buffer.buffer,
+        ipv6Buffer.byteOffset,
+        ipv6Buffer.byteLength,
       );
       // 2001:0db8:85a3:0000:0000:8a2e:0370:7334
       const ipv6 = [];
@@ -565,7 +600,7 @@ async function remoteSocketToWS(
           log(
             `remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`,
           );
-          // safeCloseWebSocket(webSocket); // no need server close websocket frist for some case will casue HTTP ERR_CONTENT_LENGTH_MISMATCH issue, client will send close event anyway.
+          safeCloseWebSocket(webSocket);
         },
         abort(reason) {
           console.error(`remoteConnection!.readable abort`, reason);
