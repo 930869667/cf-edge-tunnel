@@ -15,8 +15,6 @@ export default {
       // Cloudflare 反代IP <ipv4 or domain,ipv4 or domain,...>, 为了简化处理，默认port 443，不支持其他port
       const proxyIp = (env.PROXY_IP || null)?.trim();
       const proxyPort = 443;
-      // Cloudflare 优选IP：<ipv4 or domain,ipv4 or domain,...>， port是本站port 443
-      const cfIpList = (env.CF_IP_LIST || null)?.trim();
 
       if (!userId || !isValidUUID(userId)) {
         throw new Error("Invalid UUID format");
@@ -33,8 +31,8 @@ export default {
         request.method === "GET" &&
         normalizedPath === `/${userId}/vE4pQ9xN2k`
       ) {
-        const host = url.hostname;
-        const subscription = generateSub(cfIpList || host, userId, host);
+        const hostName = url.hostname;
+        const subscription = generateSub(userId, hostName);
 
         return new Response(subscription, {
           status: 200,
@@ -62,17 +60,11 @@ export default {
   },
 };
 
-function generateSub(cfIpList, userId, hostname) {
-  const lines = [];
-  if (cfIpList) {
-    const cfIpArray = cfIpList.split(",").map((ip) => ip.trim());
-    cfIpArray.forEach((ip) => {
-      const port = 443;
-      const url = `vless://${userId}@${ip}:${port}?type=ws&security=tls&host=${hostname}&path=/?ed=2048&sni=${hostname}#${encodeURIComponent("Cloudflare-" + ip)}`;
-      lines.push(url);
-    });
-  }
-  const sub = lines.join("\n");
+function generateSub(userId, hostName) {
+  const sub =
+    `vless://${userId}@${hostName}:443` +
+    `?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
+
   return btoa(sub);
 }
 
@@ -388,11 +380,11 @@ function processVlessHeader(vlessBuffer, userId) {
     };
   }
 
-  const optLength = buff[17];
+  const optLength = buffer[17];
   //skip opt for now
 
   const commandIndex = 18 + optLength;
-  if (buff.byteLength < commandIndex + 1) {
+  if (buffer.byteLength < commandIndex + 1) {
     return {
       hasError: true,
       message: "invalid data: command out of range",
@@ -421,7 +413,11 @@ function processVlessHeader(vlessBuffer, userId) {
   }
   const portBuffer = buffer.slice(portIndex, portIndex + 2);
   // port is big-Endian in raw data etc 80 == 0x005d
-  const portRemote = new DataView(portBuffer).getUint16(0);
+  const portRemote = new DataView(
+    portBuffer.buffer,
+    portBuffer.byteOffset,
+    portBuffer.byteLength,
+  ).getUint16(0);
 
   let addressIndex = portIndex + 2;
   if (buffer.byteLength < addressIndex + 1) {
@@ -459,7 +455,7 @@ function processVlessHeader(vlessBuffer, userId) {
           message: "invalid data: domain length out of range",
         };
       }
-      addressLength = buffer.slice(addressValueIndex);
+      addressLength = buffer[addressValueIndex];
       addressValueIndex += 1;
       if (addressLength === 0) {
         return {
@@ -586,7 +582,7 @@ async function remoteSocketToWS(
   // 2. Socket.readable will be close without any data coming
   if (hasIncomingData === false && retry) {
     try {
-      retry();
+      await retry();
     } catch (err) {
       log("retry failed", err);
       safeCloseWebSocket(webSocket);
@@ -720,10 +716,10 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
       // controller.enqueue(udpData);
 
       // }
-      const nextBuffer = concatUint8Arrays(
-        pedingUdpData,
+      const nextBuffer = concatUint8Arrays([
+        pendingUdpData,
         new Uint8Array(chunk),
-      );
+      ]);
       let offset = 0;
       while (offset + 2 <= nextBuffer.length) {
         const udpPacketLength = new DataView(
