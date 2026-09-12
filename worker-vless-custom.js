@@ -109,7 +109,7 @@ async function vlessOverWSHandler(request, userId, proxyIp, proxyPort) {
   );
 
   /** @type {{ value: import("@cloudflare/workers-types").Socket | null}}*/
-  let remoteSocketWapper = {
+  let remoteSocketWrapper = {
     value: null,
   };
   let udpStreamWrite = null;
@@ -123,8 +123,8 @@ async function vlessOverWSHandler(request, userId, proxyIp, proxyPort) {
           if (isDns && udpStreamWrite) {
             return udpStreamWrite(chunk);
           }
-          if (remoteSocketWapper.value) {
-            const writer = remoteSocketWapper.value.writable.getWriter();
+          if (remoteSocketWrapper.value) {
+            const writer = remoteSocketWrapper.value.writable.getWriter();
             await writer.write(chunk);
             writer.releaseLock();
             return;
@@ -172,7 +172,7 @@ async function vlessOverWSHandler(request, userId, proxyIp, proxyPort) {
             return;
           }
           handleTCPOutBound(
-            remoteSocketWapper,
+            remoteSocketWrapper,
             addressRemote,
             portRemote,
             proxyIp,
@@ -283,7 +283,30 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
           return;
         }
         const message = event.data;
-        controller.enqueue(message);
+
+        if (message instanceof ArrayBuffer) {
+          controller.enqueue(new Uint8Array(message));
+          return;
+        }
+        if (message instanceof Uint8Array) {
+          controller.enqueue(message);
+          return;
+        }
+        if (message instanceof Blob) {
+          message
+            .arrayBuffer()
+            .then((buffer) => {
+              if (readableStreamCancel) {
+                return;
+              }
+              controller.enqueue(new Uint8Array(buffer));
+            })
+            .catch((err) => {
+              controller.error(err);
+            });
+          return;
+        }
+        controller.error(new Error("WebSocket message must be binary"));
       });
 
       // The event means that the client closed the client -> server stream.
@@ -341,16 +364,21 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
  * @returns
  */
 function processVlessHeader(vlessBuffer, userId) {
-  if (vlessBuffer.byteLength < 24) {
+  const buffer =
+    vlessBuffer instanceof Uint8Array
+      ? vlessBuffer
+      : new Uint8Array(vlessBuffer);
+
+  if (buffer.byteLength < 24) {
     return {
       hasError: true,
       message: "invalid data",
     };
   }
-  const version = new Uint8Array(vlessBuffer.slice(0, 1));
+  const version = buffer.slice(0, 1);
   let isValidUser = false;
   let isUDP = false;
-  if (stringify(new Uint8Array(vlessBuffer.slice(1, 17))) === userId) {
+  if (stringify(buffer.slice(1, 17)) === userId) {
     isValidUser = true;
   }
   if (!isValidUser) {
@@ -360,12 +388,17 @@ function processVlessHeader(vlessBuffer, userId) {
     };
   }
 
-  const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
+  const optLength = buff[17];
   //skip opt for now
 
-  const command = new Uint8Array(
-    vlessBuffer.slice(18 + optLength, 18 + optLength + 1),
-  )[0];
+  const commandIndex = 18 + optLength;
+  if (buff.byteLength < commandIndex + 1) {
+    return {
+      hasError: true,
+      message: "invalid data: command out of range",
+    };
+  }
+  const command = buffer[commandIndex];
 
   // 0x01 TCP
   // 0x02 UDP
@@ -376,18 +409,28 @@ function processVlessHeader(vlessBuffer, userId) {
   } else {
     return {
       hasError: true,
-      message: `command ${command} is not support, command 01-tcp,02-udp,03-mux`,
+      message: `command ${command} is not supported, command 01-tcp,02-udp,03-mux`,
     };
   }
-  const portIndex = 18 + optLength + 1;
-  const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
+  const portIndex = commandIndex + 1;
+  if (buffer.byteLength < portIndex + 2) {
+    return {
+      hasError: true,
+      message: "invalid data: port out of range",
+    };
+  }
+  const portBuffer = buffer.slice(portIndex, portIndex + 2);
   // port is big-Endian in raw data etc 80 == 0x005d
   const portRemote = new DataView(portBuffer).getUint16(0);
 
   let addressIndex = portIndex + 2;
-  const addressBuffer = new Uint8Array(
-    vlessBuffer.slice(addressIndex, addressIndex + 1),
-  );
+  if (buffer.byteLength < addressIndex + 1) {
+    return {
+      hasError: true,
+      message: "invalid data: address type out of range",
+    };
+  }
+  const addressBuffer = buffer.slice(addressIndex, addressIndex + 1);
 
   // 1--> ipv4  addressLength =4
   // 2--> domain name addressLength=addressBuffer[1]
@@ -399,23 +442,45 @@ function processVlessHeader(vlessBuffer, userId) {
   switch (addressType) {
     case 1:
       addressLength = 4;
-      addressValue = new Uint8Array(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength),
-      ).join(".");
+      if (buffer.byteLength < addressValueIndex + addressLength) {
+        return {
+          hasError: true,
+          message: "invalid data: ipv4 address out of range",
+        };
+      }
+      addressValue = buffer
+        .slice(addressValueIndex, addressValueIndex + addressLength)
+        .join(".");
       break;
     case 2:
-      addressLength = new Uint8Array(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + 1),
-      )[0];
+      if (buffer.byteLength < addressValueIndex + 1) {
+        return {
+          hasError: true,
+          message: "invalid data: domain length out of range",
+        };
+      }
+      addressLength = buffer.slice(addressValueIndex);
       addressValueIndex += 1;
+      if (addressLength === 0) {
+        return {
+          hasError: true,
+          message: "invalid data: domain length is zero",
+        };
+      }
+      if (buffer.byteLength < addressValueIndex + addressLength) {
+        return {
+          hasError: true,
+          message: "invalid data: domain out of range",
+        };
+      }
       addressValue = new TextDecoder().decode(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength),
+        buffer.slice(addressValueIndex, addressValueIndex + addressLength),
       );
       break;
     case 3:
       addressLength = 16;
       const dataView = new DataView(
-        vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength),
+        buffer.slice(addressValueIndex, addressValueIndex + addressLength),
       );
       // 2001:0db8:85a3:0000:0000:8a2e:0370:7334
       const ipv6 = [];
@@ -552,6 +617,10 @@ function base64ToArrayBuffer(base64Str) {
   try {
     // go use modified Base64 for URL rfc4648 which js atob not support
     base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
+    const padding = base64Str.length % 4;
+    if (padding) {
+      base64Str += "=".repeat(4 - padding);
+    }
     const decode = atob(base64Str);
     const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
     return { earlyData: arryBuffer.buffer, error: null };
@@ -633,6 +702,7 @@ function stringify(arr, offset = 0) {
  */
 async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
   let isVlessHeaderSent = false;
+  /**@type {Uint8Array} */
   let pendingUdpData = new Uint8Array(0); // Store pending UDP data
 
   const transformStream = new TransformStream({
