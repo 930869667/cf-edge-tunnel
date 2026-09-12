@@ -236,8 +236,11 @@ async function handleTCPOutBound(
     remoteSocket.value = tcpSocket;
     log(`connected to ${address}:${port}`);
     const writer = tcpSocket.writable.getWriter();
-    await writer.write(rawClientData); // first write, nomal is tls client hello
-    writer.releaseLock();
+    try {
+      await writer.write(rawClientData); // first write, nomal is tls client hello
+    } finally {
+      writer.releaseLock();
+    }
     return tcpSocket;
   }
 
@@ -479,18 +482,22 @@ async function remoteSocketToWS(
           hasIncomingData = true;
           // remoteChunkCount++;
           if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+            safeCloseWebSocket(webSocket);
             controller.error("webSocket.readyState is not open, maybe close");
+            return;
           }
-          if (vlessHeader) {
-            webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
-            vlessHeader = null;
-          } else {
-            // seems no need rate limit this, CF seems fix this??..
-            // if (remoteChunkCount > 20000) {
-            // 	// cf one package is 4096 byte(4kb),  4096 * 20000 = 80M
-            // 	await delay(1);
-            // }
-            webSocket.send(chunk);
+          try {
+            if (vlessHeader) {
+              webSocket.send(
+                await new Blob([vlessHeader, chunk]).arrayBuffer(),
+              );
+              vlessHeader = null;
+            } else {
+              webSocket.send(chunk);
+            }
+          } catch (err) {
+            controller.error(err);
+            safeCloseWebSocket(webSocket);
           }
         },
         close() {
@@ -513,9 +520,24 @@ async function remoteSocketToWS(
   // 1. Socket.closed will have error
   // 2. Socket.readable will be close without any data coming
   if (hasIncomingData === false && retry) {
-    log(`retry`);
-    retry();
+    try {
+      retry();
+    } catch (err) {
+      log("retry failed", err);
+      safeCloseWebSocket(webSocket);
+    }
   }
+}
+
+function concatUint8Arrays(arrays) {
+  const totalLength = arrays.reduce((acc, arr) => acc + arr.length, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const arr of arrays) {
+    result.set(arr, offset);
+    offset += arr.length;
+  }
+  return result;
 }
 
 /**
@@ -611,19 +633,47 @@ function stringify(arr, offset = 0) {
  */
 async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
   let isVlessHeaderSent = false;
+  let pendingUdpData = new Uint8Array(0); // Store pending UDP data
+
   const transformStream = new TransformStream({
     start(controller) {},
     transform(chunk, controller) {
       // udp message 2 byte is the the length of udp data
       // TODO: this should have bug, beacsue maybe udp chunk can be in two websocket message
-      for (let index = 0; index < chunk.byteLength; ) {
-        const lengthBuffer = chunk.slice(index, index + 2);
-        const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
-        const udpData = new Uint8Array(
-          chunk.slice(index + 2, index + 2 + udpPakcetLength),
-        );
-        index = index + 2 + udpPakcetLength;
+      // for (let index = 0; index < chunk.byteLength; ) {
+      // const lengthBuffer = chunk.slice(index, index + 2);
+      // const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
+      // const udpData = new Uint8Array(
+      //   chunk.slice(index + 2, index + 2 + udpPakcetLength),
+      // );
+      // index = index + 2 + udpPakcetLength;
+      // controller.enqueue(udpData);
+
+      // }
+      const nextBuffer = concatUint8Arrays(
+        pedingUdpData,
+        new Uint8Array(chunk),
+      );
+      let offset = 0;
+      while (offset + 2 <= nextBuffer.length) {
+        const udpPacketLength = new DataView(
+          nextBuffer.buffer,
+          nextBuffer.byteOffset + offset,
+          2,
+        ).getUint16(0);
+        const totalPacketSize = 2 + udpPacketLength;
+        if (offset + totalPacketSize > nextBuffer.length) {
+          pendingUdpData = nextBuffer.slice(offset);
+          return;
+        }
+        const udpData = nextBuffer.slice(offset + 2, offset + totalPacketSize);
         controller.enqueue(udpData);
+        offset += totalPacketSize;
+      }
+      if (offset < nextBuffer.length) {
+        pendingUdpData = nextBuffer.slice(offset);
+      } else {
+        pendingUdpData = new Uint8Array(0);
       }
     },
     flush(controller) {},
@@ -650,19 +700,24 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
           ]);
           if (webSocket.readyState === WS_READY_STATE_OPEN) {
             log(`doh success and dns message length is ${udpSize}`);
-            if (isVlessHeaderSent) {
-              webSocket.send(
-                await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer(),
-              );
-            } else {
-              webSocket.send(
-                await new Blob([
-                  vlessResponseHeader,
-                  udpSizeBuffer,
-                  dnsQueryResult,
-                ]).arrayBuffer(),
-              );
-              isVlessHeaderSent = true;
+            try {
+              if (isVlessHeaderSent) {
+                webSocket.send(
+                  await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer(),
+                );
+              } else {
+                webSocket.send(
+                  await new Blob([
+                    vlessResponseHeader,
+                    udpSizeBuffer,
+                    dnsQueryResult,
+                  ]).arrayBuffer(),
+                );
+                isVlessHeaderSent = true;
+              }
+            } catch (err) {
+              log("dns udp send has error", err);
+              safeCloseWebSocket(webSocket);
             }
           }
         },
