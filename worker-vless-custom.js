@@ -198,17 +198,14 @@ async function vlessOverWSHandler(request, userId, proxyIp, proxyPort) {
         },
         close() {
           log("readableWebSocketStream is close (peer close ws input stream)");
-          closeRemoteSocket();
         },
         abort(reason) {
           log("readableWebSocketStream is abort", JSON.stringify(reason));
-          closeRemoteSocket();
         },
       }),
     )
     .catch((err) => {
       log("readableWebSocketStream pipeTo error", err);
-      closeRemoteSocket();
     });
 
   return new Response(null, {
