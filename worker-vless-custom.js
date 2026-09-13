@@ -91,7 +91,7 @@ async function vlessOverWSHandler(request, userId, proxyIp, proxyPort = 443) {
 
   webSocket.accept();
 
-  const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
+  const earlyDataHeader = request.headers.get("sec-websocket-protocol") || null;
 
   const readableWebSocketStream = makeReadableWebSocketStream(
     webSocket,
@@ -232,20 +232,15 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
   const stream = new ReadableStream({
     start(controller) {
       webSocketServer.addEventListener("message", (event) => {
-        if (readableStreamCancel) {
-          return;
-        }
+        if (readableStreamCancel) return;
+
         const message = event.data;
 
         if (message instanceof ArrayBuffer) {
           controller.enqueue(new Uint8Array(message));
-          return;
-        }
-        if (message instanceof Uint8Array) {
+        } else if (message instanceof Uint8Array) {
           controller.enqueue(message);
-          return;
-        }
-        if (message instanceof Blob) {
+        } else if (message instanceof Blob) {
           message
             .arrayBuffer()
             .then((buffer) => {
@@ -257,9 +252,9 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
             .catch((err) => {
               controller.error(err);
             });
-          return;
+        } else {
+          controller.error(`WebSocket message must be binary`);
         }
-        controller.error(`WebSocket message must be binary`);
       });
 
       // The event means that the client closed the client -> server stream.
@@ -269,21 +264,17 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
         // client send close, need close server
         // if stream is cancel, skip controller.close
         safeCloseWebSocket(webSocketServer);
-        if (readableStreamCancel) {
-          return;
-        }
         controller.close();
       });
+
       webSocketServer.addEventListener("error", (err) => {
         console.error("webSocketServer has error", err);
         controller.error(err);
       });
+
       // for ws 0rtt
-      const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-      if (error) {
-        console.error(`base64ToArrayBuffer earlyDataHeader error, ${error}`);
-        controller.error(error);
-      } else if (earlyData) {
+      const earlyData = base64ToArrayBuffer(earlyDataHeader);
+      if (earlyData) {
         controller.enqueue(earlyData);
       }
     },
@@ -509,7 +500,7 @@ function concatUint8Arrays(arrays) {
 
 function base64ToArrayBuffer(base64Str) {
   if (!base64Str) {
-    throw new Error("base64Str is empty");
+    return null;
   }
   try {
     // go use modified Base64 for URL rfc4648 which js atob not support
@@ -520,7 +511,7 @@ function base64ToArrayBuffer(base64Str) {
     }
     const decode = atob(base64Str);
     const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
-    return { earlyData: arryBuffer.buffer, error: null };
+    return arryBuffer.buffer;
   } catch (err) {
     throw new Error(`base64ToArrayBuffer error: ${err.message}`);
   }
@@ -633,7 +624,7 @@ async function handleUDPOutbound(webSocket, vlessResponseHeader) {
             udpSize & 0xff,
           ]);
           if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            console.log(`doh success and dns message length is ${udpSize}`);           
+            console.log(`doh success and dns message length is ${udpSize}`);
             try {
               if (isVlessHeaderSent) {
                 webSocket.send(
@@ -650,7 +641,9 @@ async function handleUDPOutbound(webSocket, vlessResponseHeader) {
                 isVlessHeaderSent = true;
               }
             } catch (err) {
-              console.error(`handleUDPOutbound send to ws error: ${err.message}`);
+              console.error(
+                `handleUDPOutbound send to ws error: ${err.message}`,
+              );
               safeCloseWebSocket(webSocket);
             }
           }
