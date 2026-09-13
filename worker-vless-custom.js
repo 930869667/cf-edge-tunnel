@@ -257,8 +257,10 @@ async function handleTCPOutBound(
     return tcpSocket;
   }
 
+  // 当直连 Cloudflare 节点无数据响应时触发代理重试
   // if the cf connect tcp socket have no incoming data, we retry to redirect ip
   async function retry() {
+    // 1. 关闭直连失败的旧 Socket
     // Clean up the original socket before re-establishing the proxy connection
     if (remoteSocket.value) {
       try {
@@ -268,19 +270,21 @@ async function handleTCPOutBound(
       }
       remoteSocket.value = null;
     }
-    const tcpSocket = await connectAndWrite(
+    // 3. 重新建立代理连接（connectAndWrite 会自动更新 remoteSocket.value）
+    const retrySocket = await connectAndWrite(
       proxyIp || addressRemote,
       proxyPort || portRemote,
     );
     // no matter retry success or not, close websocket
-    tcpSocket.closed
+    retrySocket.closed
       .catch((error) => {
         console.log("retry tcpSocket closed error", error);
       })
       .finally(() => {
         safeCloseWebSocket(webSocket);
       });
-    remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+      // 5. 重新将 Socket 的读取流桥接到 WebSocket（注意 retry 传 null 避免二次递归）
+    remoteSocketToWS(retrySocket, webSocket, vlessResponseHeader, null, log);
   }
 
   const tcpSocket = await connectAndWrite(addressRemote, portRemote);
