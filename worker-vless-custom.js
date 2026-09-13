@@ -1,4 +1,3 @@
-// @ts-ignore
 import { connect } from "cloudflare:sockets";
 
 const WS_READY_STATE_OPEN = 1;
@@ -16,7 +15,7 @@ export default {
   async fetch(request, env) {
     try {
       // If env.USER_ID is undefined, an empty string, or missing, the expression evaluates to null
-      const userId = (env.USER_ID || null)?.trim();
+      const userId = (env.USER_ID || null)?.trim()?.toLowerCase();
       // Cloudflare 反代IP <ipv4 or domain>, 为了简化处理，默认port 443，不支持其他port
       const proxyIp = (env.PROXY_IP || null)?.trim();
       // Cloudflare 优选IP：<ipv4 or domain,ipv4 or domain,...>， port是本站port 443
@@ -148,16 +147,22 @@ async function vlessOverWSHandler(request, userId, proxyIp, proxyPort = 443) {
             udpStreamWrite(rawClientData);
             return;
           }
-          handleTCPOutBound(
-            remoteSocketWrapper,
-            addressRemote,
-            portRemote,
-            proxyIp,
-            proxyPort,
-            rawClientData,
-            webSocket,
-            vlessResponseHeader,
-          );
+          try {
+            await handleTCPOutBound(
+              remoteSocketWrapper,
+              addressRemote,
+              portRemote,
+              proxyIp,
+              proxyPort,
+              rawClientData,
+              webSocket,
+              vlessResponseHeader,
+            );
+          } catch (err) {
+            console.error(`handleTCPOutBound error: ${err.message}`);
+            safeCloseWebSocket(webSocket);
+            controller.error(err);
+          }
         },
         close() {
           console.log(`readableWebSocketStream is close`);
@@ -169,6 +174,7 @@ async function vlessOverWSHandler(request, userId, proxyIp, proxyPort = 443) {
     )
     .catch((err) => {
       console.error(`readableWebSocketStream pipeTo has exception: ${err}`);
+      safeCloseWebSocket(webSocket);
     });
 
   return new Response(null, {
@@ -275,6 +281,9 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
       // for ws 0rtt
       const earlyData = base64ToArrayBuffer(earlyDataHeader);
       if (earlyData) {
+        if (earlyData.byteLength > 4 * 1024) {
+          throw new Error("earlyDataHeader is too large, max 4KB");
+        }
         controller.enqueue(earlyData);
       }
     },
@@ -390,8 +399,13 @@ function processVlessHeader(vlessBuffer, userId) {
       break;
     case 3:
       addressLength = 16;
+      if (buffer.byteLength < addressValueIndex + addressLength) {
+        throw new Error("invalid data: ipv6 address out of range");
+      }
       const dataView = new DataView(
-        buffer.slice(addressValueIndex, addressValueIndex + addressLength),
+        buffer.buffer,
+        buffer.byteOffset + addressValueIndex,
+        addressLength,
       );
       // 2001:0db8:85a3:0000:0000:8a2e:0370:7334
       const ipv6 = [];
@@ -428,6 +442,7 @@ async function remoteSocketToWS(
 
   let vlessHeader = vlessResponseHeader;
   let hasIncomingData = false; // check if remoteSocket has incoming data
+
   await remoteSocket.readable
     .pipeTo(
       new WritableStream({
@@ -510,8 +525,7 @@ function base64ToArrayBuffer(base64Str) {
       base64Str += "=".repeat(4 - padding);
     }
     const decode = atob(base64Str);
-    const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
-    return arryBuffer.buffer;
+    return Uint8Array.from(decode, (c) => c.charCodeAt(0));
   } catch (err) {
     throw new Error(`base64ToArrayBuffer error: ${err.message}`);
   }
@@ -609,14 +623,28 @@ async function handleUDPOutbound(webSocket, vlessResponseHeader) {
     .pipeTo(
       new WritableStream({
         async write(chunk) {
-          const resp = await fetch("https://1.1.1.1/dns-query", {
-            method: "POST",
-            headers: {
-              "content-type": "application/dns-message",
-            },
-            body: chunk,
-          });
-          const dnsQueryResult = await resp.arrayBuffer();
+          const abortController = new AbortController();
+          const timeoutId = setTimeout(() => {
+            abortController.abort("dns query timeout");
+          }, 5000); // 5 seconds timeout
+          let dnsQueryResult;
+          try {
+            const resp = await fetch("https://1.1.1.1/dns-query", {
+              method: "POST",
+              headers: {
+                "content-type": "application/dns-message",
+              },
+              body: chunk,
+              signal: abortController.signal,
+            });
+            if (!resp.ok) {
+              throw new Error(`DNS query failed with status ${resp.status}`);
+            }
+            dnsQueryResult = await resp.arrayBuffer();
+          } finally {
+            clearTimeout(timeoutId);
+          }
+
           const udpSize = dnsQueryResult.byteLength;
 
           const udpSizeBuffer = new Uint8Array([
