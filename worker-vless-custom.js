@@ -69,15 +69,15 @@ export default {
 
 function generateSub(cfIpList, userId, hostName) {
   // 客户端（v2rayN/Shadowrocket）默认下发 Base64 编码的 VLESS 节点链接
-  const lines = [];
-  if (cfIpList) {
-    const cfIPs = cfIpList.split(",").map((ip) => ip.trim());
-    cfIPs.forEach((ip) => {
-      const vlessLink = `vless://${userId}@${ip}:443?type=ws&security=tls&host=${hostName}&fp=chrome&path=%2F%3Fed%3D2048&sni=${hostName}#${encodeURIComponent("Cloudflare-" + ip)}`;
-      lines.push(vlessLink);
-    });
-  }
-  const sub = lines.join("\n");
+  if (!cfIpList) return "";
+  const sub = cfIpList
+    .split(",")
+    .map((ip) => ip.trim())
+    .map(
+      (ip) =>
+        `vless://${userId}@${ip}:443?type=ws&security=tls&host=${hostName}&fp=chrome&path=%2F%3Fed%3D2048&sni=${hostName}#${encodeURIComponent("Cloudflare-" + ip)}`,
+    )
+    .join("\n");
   return btoa(sub);
 }
 
@@ -475,7 +475,7 @@ async function remoteSocketToWS(
               combined.set(new Uint8Array(vlessHeader), 0);
               combined.set(chunk, vlessHeader.byteLength);
               webSocket.send(combined.buffer);
-              vlessHeader = null;
+              vlessHeader = false;
             } else {
               webSocket.send(chunk);
             }
@@ -524,16 +524,11 @@ function concatUint8Arrays(arrays) {
 }
 
 function base64ToArrayBuffer(base64Str) {
-  if (!base64Str)     return null;
+  if (!base64Str) return null;
   try {
     // go use modified Base64 for URL rfc4648 which js atob not support
-    base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
-    const padding = base64Str.length % 4;
-    if (padding) {
-      base64Str += "=".repeat(4 - padding);
-    }
-    const decode = atob(base64Str);
-    return Uint8Array.from(decode, (c) => c.charCodeAt(0));
+    const binary = atob(base64Str.replace(/-/g, "+").replace(/_/g, "/"));
+    return Uint8Array.from(binary, (c) => c.charCodeAt(0));
   } catch (err) {
     console.error(`base64 decode error: ${err.message}`);
     return null; // 发生非法字符解析失败时返回 null，避免直接崩溃退出);
@@ -691,7 +686,7 @@ async function handleUDPOutbound(webSocket, vlessResponseHeader) {
       //当 Fetch 请求超时（abort）或遇到其他异常抛出时，进入此 catch
       console.error(`handleUDPOutbound pipeTo has exception ${err.message}`);
       safeCloseWebSocket(webSocket);
-      
+
       // 增加此处的修复：主动释放/中断 writer，防止 TransformStream 管道挂起
       try {
         writer.abort(err);
