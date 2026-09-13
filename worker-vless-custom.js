@@ -557,9 +557,14 @@ async function remoteSocketToWS(
           }
           try {
             if (vlessHeader) {
-              webSocket.send(
-                await new Blob([vlessHeader, chunk]).arrayBuffer(),
+              
+              // With zero-async ArrayBuffer allocation:
+              const combined = new Uint8Array(
+                vlessHeader.byteLength + chunk.byteLength,
               );
+              combined.set(new Uint8Array(vlessHeader), 0);
+              combined.set(chunk, vlessHeader.byteLength);
+              webSocket.send(combined.buffer);
               vlessHeader = null;
             } else {
               webSocket.send(chunk);
@@ -572,8 +577,7 @@ async function remoteSocketToWS(
         close() {
           log(
             `remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`,
-          );
-          // safeCloseWebSocket(webSocket); // no need server close websocket frist for some case will casue HTTP ERR_CONTENT_LENGTH_MISMATCH issue, client will send close event anyway.
+          );          
         },
         abort(reason) {
           console.error(`remoteConnection!.readable abort`, reason);
