@@ -531,7 +531,7 @@ function base64ToArrayBuffer(base64Str) {
     return Uint8Array.from(binary, (c) => c.charCodeAt(0));
   } catch (err) {
     console.error(`base64 decode error: ${err.message}`);
-    return null; // 发生非法字符解析失败时返回 null，避免直接崩溃退出);
+    return null; // 发生非法字符解析失败时返回 null，避免直接崩溃退出
   }
 }
 
