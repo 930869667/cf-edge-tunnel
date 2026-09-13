@@ -62,6 +62,13 @@ export default {
   },
 };
 
+/**
+ * Generates a VLESS subscription string based on the provided Cloudflare IP list, user ID, and host name.
+ * @param {string | null} cfIpList 
+ * @param {string} userId 
+ * @param {string} hostName 
+ * @returns 
+ */
 function generateSub(cfIpList, userId, hostName) {
   const lines = [];
   if (cfIpList) {
