@@ -59,10 +59,7 @@ export default {
       // =========================================================================
       // 3. 静态伪装机制：既不是订阅也不是 WS，返回页面
       // =========================================================================
-      return new Response("Bad Request", {
-        status: 400,
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
-      });
+      return new Response("404 Not Found", { status: 404 });
     } catch (err) {
       console.error(`[服务器内部错误] fetch 流程阻断: ${err.message}`);
       return new Response(`Internal Server Error`, { status: 500 });
@@ -214,6 +211,14 @@ async function handleTCPOutBound(
     if (!proxyIp || !proxyPort) {
       throw new Error("retry failed, proxyIp or proxyPort is not set");
     }
+    // 关键修复：主动关闭之前的直连 Socket, 避免资源泄漏和潜在的连接冲突
+    if (remoteSocket.value) {
+      try {
+        remoteSocket.value.close();
+      } catch (err) {
+        console.error(`close original socket error: ${err.message}`);
+      }
+    }
     const tcpSocket = await connectAndWrite(proxyIp, proxyPort);
     // no matter retry success or not, close websocket
     tcpSocket.closed
@@ -284,7 +289,12 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
         if (earlyData.byteLength > 4 * 1024) {
           throw new Error("earlyDataHeader is too large, max 4KB");
         }
-        controller.enqueue(earlyData);
+        // enqueue 尽量保障捕获异常
+        try {
+          controller.enqueue(earlyData);
+        } catch (err) {
+          console.error(`enqueue earlyData error: ${err.message}`);
+        }
       }
     },
 
@@ -514,9 +524,7 @@ function concatUint8Arrays(arrays) {
 }
 
 function base64ToArrayBuffer(base64Str) {
-  if (!base64Str) {
-    return null;
-  }
+  if (!base64Str)     return null;
   try {
     // go use modified Base64 for URL rfc4648 which js atob not support
     base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
@@ -527,7 +535,8 @@ function base64ToArrayBuffer(base64Str) {
     const decode = atob(base64Str);
     return Uint8Array.from(decode, (c) => c.charCodeAt(0));
   } catch (err) {
-    throw new Error(`base64ToArrayBuffer error: ${err.message}`);
+    console.error(`base64 decode error: ${err.message}`);
+    return null; // 发生非法字符解析失败时返回 null，避免直接崩溃退出);
   }
 }
 
@@ -679,7 +688,16 @@ async function handleUDPOutbound(webSocket, vlessResponseHeader) {
       }),
     )
     .catch((err) => {
-      console.error(`handleUDPOutbound pipeTo has exception ${err}`);
+      //当 Fetch 请求超时（abort）或遇到其他异常抛出时，进入此 catch
+      console.error(`handleUDPOutbound pipeTo has exception ${err.message}`);
+      safeCloseWebSocket(webSocket);
+      
+      // 增加此处的修复：主动释放/中断 writer，防止 TransformStream 管道挂起
+      try {
+        writer.abort(err);
+      } catch (e) {
+        // 忽略已关闭的 writer 报错
+      }
     });
 
   const writer = transformStream.writable.getWriter();
