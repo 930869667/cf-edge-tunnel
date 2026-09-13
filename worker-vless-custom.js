@@ -12,9 +12,11 @@ export default {
     try {
       // If env.USER_ID is undefined, an empty string, or missing, the expression evaluates to null
       const userId = (env.USER_ID || null)?.trim();
-      // Cloudflare 反代IP <ipv4 or domain,ipv4 or domain,...>, 为了简化处理，默认port 443，不支持其他port
+      // Cloudflare 反代IP <ipv4 or domain>, 为了简化处理，默认port 443，不支持其他port
       const proxyIp = (env.PROXY_IP || null)?.trim();
       const proxyPort = 443;
+      // Cloudflare 优选IP：<ipv4 or domain,ipv4 or domain,...>， port是本站port 443
+      const cfIpList = (env.CF_IP_LIST || null)?.trim();
 
       if (!userId || !isValidUUID(userId)) {
         throw new Error("Invalid UUID format");
@@ -32,7 +34,7 @@ export default {
         normalizedPath === `/${userId}/vE4pQ9xN2k`
       ) {
         const hostName = url.hostname;
-        const subscription = generateSub(userId, hostName);
+        const subscription = generateSub(cfIpList, userId, hostName);
 
         return new Response(subscription, {
           status: 200,
@@ -60,11 +62,17 @@ export default {
   },
 };
 
-function generateSub(userId, hostName) {
-  const sub =
-    `vless://${userId}@${hostName}:443` +
-    `?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
-
+function generateSub(cfIpList, userId, hostName) {
+  const lines = [];
+  if (cfIpList) {
+    const cfIpArray = cfIpList.split(",").map((ip) => ip.trim());
+    cfIpArray.forEach((ip) => {
+      const port = 443;
+      const url = `vless://${userId}@${ip}:${port}?type=ws&security=tls&host=${hostName}&fp=chrome&path=%2F%3Fed%3D2048&sni=${hostName}#${encodeURIComponent("Cloudflare-" + ip)}`;
+      lines.push(url);
+    });
+  }
+  const sub = lines.join("\n");
   return btoa(sub);
 }
 
