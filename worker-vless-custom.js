@@ -68,7 +68,7 @@ function generateSub(cfIpList, userId, hostName) {
     const cfIpArray = cfIpList.split(",").map((ip) => ip.trim());
     cfIpArray.forEach((ip) => {
       const port = 443;
-      const url = `vless://${userId}@${ip}:${port}?type=ws&security=tls&host=${hostName}&fp=chrome&path=path=%2F%3Fed%3D2048&sni=${hostName}#${encodeURIComponent("Cloudflare-" + ip)}`;
+      const url = `vless://${userId}@${ip}:${port}?type=ws&security=tls&host=${hostName}&fp=chrome&path=%2F%3Fed%3D2048&sni=${hostName}#${encodeURIComponent("Cloudflare-" + ip)}`;
       lines.push(url);
     });
   }
@@ -622,8 +622,7 @@ async function remoteSocketToWS(
       }),
     )
     .catch((error) => {
-      console.error(`remoteSocketToWS has exception `, error.stack || error);
-      safeCloseWebSocket(webSocket);
+      console.error(`remoteSocketToWS has exception `, error.stack || error);    
     });
 
   // seems is cf connect socket have error,
