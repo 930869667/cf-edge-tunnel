@@ -15,6 +15,8 @@ export default {
       // Cloudflare 反代IP <ipv4 or domain,ipv4 or domain,...>, 为了简化处理，默认port 443，不支持其他port
       const proxyIp = (env.PROXY_IP || null)?.trim();
       const proxyPort = 443;
+      // Cloudflare 优选IP：<ipv4 or domain,ipv4 or domain,...>， port是本站port 443
+      const cfIpList = (env.CF_IP_LIST || null)?.trim();
 
       if (!userId || !isValidUUID(userId)) {
         throw new Error("Invalid UUID format");
@@ -32,7 +34,7 @@ export default {
         normalizedPath === `/${userId}/vE4pQ9xN2k`
       ) {
         const hostName = url.hostname;
-        const subscription = generateSub(userId, hostName);
+        const subscription = generateSub(cfIpList, userId, hostName);
 
         return new Response(subscription, {
           status: 200,
@@ -60,11 +62,17 @@ export default {
   },
 };
 
-function generateSub(userId, hostName) {
-  const sub =
-    `vless://${userId}@${hostName}:443` +
-    `?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#${hostName}`;
-
+function generateSub(cfIpList, userId, hostName) {
+  const lines = [];
+  if (cfIpList) {
+    const cfIpArray = cfIpList.split(",").map((ip) => ip.trim());
+    cfIpArray.forEach((ip) => {
+      const port = 443;
+      const url = `vless://${userId}@${ip}:${port}?type=ws&security=tls&host=${hostName}&fp=chrome&path=path=%2F%3Fed%3D2048&sni=${hostName}#${encodeURIComponent("Cloudflare-" + ip)}`;
+      lines.push(url);
+    });
+  }
+  const sub = lines.join("\n");
   return btoa(sub);
 }
 
@@ -254,6 +262,15 @@ async function handleTCPOutBound(
 
   // if the cf connect tcp socket have no incoming data, we retry to redirect ip
   async function retry() {
+    // Clean up the original socket before re-establishing the proxy connection
+    if (remoteSocket.value) {
+      try {
+        remoteSocket.value.close();
+      } catch (e) {
+        log("Error closing original socket on retry", e);
+      }
+      remoteSocket.value = null;
+    }
     const tcpSocket = await connectAndWrite(
       proxyIp || addressRemote,
       proxyPort || portRemote,
@@ -642,21 +659,20 @@ function concatUint8Arrays(arrays) {
  * @returns
  */
 function base64ToArrayBuffer(base64Str) {
-  if (!base64Str) {
-    return { error: null };
-  }
+  if (!base64Str) return { earlyData: null, error: null };
   try {
-    // go use modified Base64 for URL rfc4648 which js atob not support
     base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
     const padding = base64Str.length % 4;
-    if (padding) {
-      base64Str += "=".repeat(4 - padding);
+    if (padding) base64Str += "=".repeat(4 - padding);
+
+    const binaryStr = atob(base64Str);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
     }
-    const decode = atob(base64Str);
-    const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
-    return { earlyData: arryBuffer.buffer, error: null };
+    return { earlyData: bytes.buffer, error: null };
   } catch (error) {
-    return { error };
+    return { earlyData: null, error };
   }
 }
 
@@ -802,18 +818,22 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
           if (webSocket.readyState === WS_READY_STATE_OPEN) {
             log(`doh success and dns message length is ${udpSize}`);
             try {
+              const dnsBuffer = new Uint8Array(dnsQueryResult);
               if (isVlessHeaderSent) {
-                webSocket.send(
-                  await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer(),
-                );
+                const packet = new Uint8Array(2 + udpSize);
+                packet.set(udpSizeBuffer, 0);
+                packet.set(dnsBuffer, 2);
+                webSocket.send(packet.buffer);
               } else {
-                webSocket.send(
-                  await new Blob([
-                    vlessResponseHeader,
-                    udpSizeBuffer,
-                    dnsQueryResult,
-                  ]).arrayBuffer(),
+                const headerBuffer = new Uint8Array(vlessResponseHeader);
+                const packet = new Uint8Array(
+                  headerBuffer.length + 2 + udpSize,
                 );
+                packet.set(headerBuffer, 0);
+                packet.set(udpSizeBuffer, headerBuffer.length);
+                packet.set(dnsBuffer, headerBuffer.length + 2);
+
+                webSocket.send(packet.buffer);
                 isVlessHeaderSent = true;
               }
             } catch (err) {
