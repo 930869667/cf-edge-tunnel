@@ -6,7 +6,6 @@ import { connect } from "cloudflare:sockets";
  * 2 (CLOSING): 正在执行 Close 帧握手
  */
 const WS_READY_STATE_OPEN = 1;
-const MAX_WS_FRAME_SIZE = 1024 * 1024; // 1MB
 
 const ALLOWED_UDP_PORTS = new Set([53]);
 
@@ -150,8 +149,11 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
           // 当与远端服务器的 TCP 物理 Socket 已建立，后续的所有客户端 Payload 绕过 Header 解析，直接写入 Socket
           if (remoteSocketWrapper.value) {
             const writer = remoteSocketWrapper.value.writable.getWriter();
-            await writer.write(chunk);
-            writer.releaseLock(); // 极其重要：必须及时释放 Stream 锁，防止下一步管道锁死
+            try {
+              await writer.write(chunk);
+            } finally {
+              writer.releaseLock(); // 极其重要：必须及时释放 Stream 锁，防止下一步管道锁死
+            }
             return;
           }
 
@@ -395,9 +397,6 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
         const message = event.data;
 
         if (message instanceof ArrayBuffer) {
-          if (message.byteLength > MAX_WS_FRAME_SIZE) {
-            throw new Error(`WebSocket frame too large`);
-          }
           controller.enqueue(new Uint8Array(message));
         } else if (message instanceof Uint8Array) {
           controller.enqueue(message);
@@ -407,9 +406,6 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
             .then((buffer) => {
               if (readableStreamCancel) {
                 return;
-              }
-              if (buffer.byteLength > MAX_WS_FRAME_SIZE) {
-                throw new Error(`WebSocket frame too large`);
               }
               controller.enqueue(new Uint8Array(buffer));
             })
@@ -497,8 +493,8 @@ function processVlessHeader(vlessBuffer, userId) {
       ? vlessBuffer
       : new Uint8Array(vlessBuffer);
 
-  if (buffer.byteLength < 24) {
-    throw new Error("invalid data: buffer length is less than 24 bytes");
+  if (buffer.byteLength < 26) {
+    throw new Error("invalid data: buffer length is less than 26 bytes");
   }
   // 1. 协议版本 (Version), 不需要校验
   const version = buffer[0];
