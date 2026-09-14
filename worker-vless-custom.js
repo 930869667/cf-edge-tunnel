@@ -236,14 +236,22 @@ async function handleTCPOutBound(
       hostname: address,
       port: port,
     });
-    remoteSocket.value = tcpSocket;
 
     const writer = tcpSocket.writable.getWriter();
     try {
       await writer.write(rawClientData); // 写入首包数据（通常是 TLS Client Hello 或 HTTP 请求）
+    } catch (err) {
+      try {
+        tcpSocket.close();
+      } catch {
+        console.error(`close tcpSocket error: ${err.message}`);
+      }
+      throw new Error(`connectAndWrite failed, ${err.message}`);
     } finally {
       writer.releaseLock();
     }
+    remoteSocket.value = tcpSocket;
+
     return tcpSocket;
   }
 
@@ -339,6 +347,9 @@ async function pipeRemoteToWS(
           console.log(
             `remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`,
           );
+          if (hasIncomingData) {
+            safeCloseWebSocket(webSocket);
+          }
         },
         abort(reason) {
           console.error(`remoteConnection!.readable abort ${reason}`);
@@ -348,6 +359,7 @@ async function pipeRemoteToWS(
     .catch((err) => {
       console.error(`pipeRemoteToWS has exception ${err.message}`);
       safeCloseWebSocket(webSocket);
+      throw new Error(`pipeRemoteToWS has exception ${err.message}`);
     });
 
   // 触发重试逻辑的关键条件：连接已断开 + 从未收到过远端数据 + 挂载了重试函数
@@ -480,7 +492,7 @@ function processVlessHeader(vlessBuffer, userId) {
   const version = buffer[0];
 
   // 2. 身份校验 (1-16 字节为 UUID)
-  if (stringify(buffer.slice(1, 17)) !== userId) {
+  if (byteToUUID(buffer.slice(1, 17)) !== userId) {
     throw new Error("Authentication failed: UUID mismatch");
   }
 
@@ -556,7 +568,10 @@ function processVlessHeader(vlessBuffer, userId) {
       if (buffer.byteLength < addressValueIndex + addressLength) {
         throw new Error("invalid data: domain address out of range");
       }
-      const decoder = new TextDecoder("utf-8");
+      const decoder = new TextDecoder("utf-8", {
+        fatal: true,
+        ignoreBOM: false, // Add this line to satisfy the type definition
+      });
       addressValue = decoder.decode(
         buffer.slice(addressValueIndex, addressValueIndex + addressLength),
       );
@@ -641,10 +656,7 @@ function isValidUUID(uuid) {
  */
 function safeCloseWebSocket(socket) {
   try {
-    if (
-      socket.readyState === WS_READY_STATE_OPEN ||
-      socket.readyState === WS_READY_STATE_CLOSING
-    ) {
+    if (socket.readyState === WS_READY_STATE_OPEN) {
       socket.close();
     }
   } catch (err) {
@@ -658,7 +670,7 @@ function safeCloseWebSocket(socket) {
  * 16 进制字符串（即 ['00', '01', ..., 'ff']）, 转换时，直接通过下标取值（如 byteToHex[255]
  * 瞬间返回 'ff'）。用极小的内存空间，换取了接近 CPU 极限的查找速度
  */
-function unsafeStringify(arr, offset = 0) {
+function byteToUUID(arr, offset = 0) {
   return (
     byteToHex[arr[offset + 0]] +
     byteToHex[arr[offset + 1]] +
@@ -681,18 +693,6 @@ function unsafeStringify(arr, offset = 0) {
     byteToHex[arr[offset + 14]] +
     byteToHex[arr[offset + 15]]
   ).toLowerCase();
-}
-
-/**
- * 将 16 字节二进制 Uint8Array 转换为标准的 UUID 格式字符串
- * 原理：避免使用低效的 Hex 数组字典映射，直接利用 JS 原生 PadStart 构建
- */
-function stringify(arr, offset = 0) {
-  const uuid = unsafeStringify(arr, offset);
-  if (!isValidUUID(uuid)) {
-    throw new Error(`Invalid UUID format: ${uuid}`);
-  }
-  return uuid;
 }
 
 // =========================================================================
@@ -772,36 +772,42 @@ async function createUDPHandler(webSocket, vlessResponseHeader) {
           }
 
           // 重新组装 VLESS UDP 返回帧格式：[2 字节 UDP 长度] + [DNS 回应 Payload]
-          const udpSize = dnsQueryResult.byteLength;
+          // UDP length field is 2 bytes, so maximum is 65535
+          if (dnsQueryResult.byteLength > 65535) {
+            throw new Error(
+              `DNS response too large: ${dnsQueryResult.byteLength}`,
+            );
+          }
+
+          const dnsResponse = new Uint8Array(dnsQueryResult);
+          const udpSize = dnsResponse.byteLength;
 
           const udpSizeBuffer = new Uint8Array([
             (udpSize >> 8) & 0xff,
             udpSize & 0xff,
           ]);
-          if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            console.log(`doh success and dns message length is ${udpSize}`);
-            try {
-              if (isVlessHeaderSent) {
-                webSocket.send(
-                  await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer(),
-                );
-              } else {
-                // 首次回传同样需要封装 VLESS 响应报头
-                webSocket.send(
-                  await new Blob([
-                    vlessResponseHeader,
-                    udpSizeBuffer,
-                    dnsQueryResult,
-                  ]).arrayBuffer(),
-                );
-                isVlessHeaderSent = true;
-              }
-            } catch (err) {
-              console.error(
-                `createUDPHandler send to ws error: ${err.message}`,
-              );
-              safeCloseWebSocket(webSocket);
+          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+            return;
+          }
+
+          console.log(`doh success and dns message length is ${udpSize}`);
+          try {
+            const responseParts = [];
+            // VLESS response header is sent only once.
+            if (!isVlessHeaderSent) {
+              responseParts.push(vlessResponseHeader);
             }
+            // VLESS UDP response: // [2 bytes UDP length] + [UDP payload]
+            responseParts.push(udpSizeBuffer, dnsResponse);
+            const response = concatUint8Arrays(responseParts);
+            webSocket.send(response.buffer);
+            isVlessHeaderSent = true;
+          } catch (err) {
+            console.error(`createUDPHandler send to ws error: ${err.message}`);
+            safeCloseWebSocket(webSocket);
+            throw new Error(
+              `createUDPHandler send to ws error: ${err.message}`,
+            );
           }
         },
       }),
