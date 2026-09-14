@@ -6,7 +6,9 @@ import { connect } from "cloudflare:sockets";
  * 2 (CLOSING): 正在执行 Close 帧握手
  */
 const WS_READY_STATE_OPEN = 1;
-const WS_READY_STATE_CLOSING = 2;
+const MAX_WS_FRAME_SIZE = 1024 * 1024; // 1MB
+
+const ALLOWED_UDP_PORTS = new Set([53]);
 
 const byteToHex = [];
 for (let i = 0; i < 256; ++i) {
@@ -163,9 +165,9 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
           if (header.isUDP) {
             // 安全限制：基于 Cloudflare Worker 的无状态 Serverless 特性，
             // 目前 UDP 代理仅支持 53 端口的 DNS 报文转发（转换为 DoH）
-            if (header.portRemote !== 53) {
+            if (!ALLOWED_UDP_PORTS.has(header.portRemote)) {
               throw new Error(
-                "UDP proxy is strictly disabled except for DNS (port 53)",
+                `UDP proxy is strictly disabled except for DNS with port ${ALLOWED_UDP_PORTS}`,
               );
             }
             isDnsMode = true;
@@ -205,7 +207,9 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
       }),
     )
     .catch((err) => {
-      console.error(`readableWebSocketStream pipeTo has exception: ${err}`);
+      console.error(
+        `readableWebSocketStream pipeTo has exception: ${err.message}`,
+      );
       safeCloseWebSocket(webSocket);
     });
 
@@ -279,7 +283,7 @@ async function handleTCPOutBound(
     // no matter retry success or not, close websocket
     tcpSocket.closed
       .catch((err) => {
-        console.error(`retry tcpSocket closed error, ${err}`);
+        console.error(`retry tcpSocket closed error, ${err.message}`);
       })
       .finally(() => {
         safeCloseWebSocket(webSocket);
@@ -391,6 +395,9 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
         const message = event.data;
 
         if (message instanceof ArrayBuffer) {
+          if (message.byteLength > MAX_WS_FRAME_SIZE) {
+            throw new Error(`WebSocket frame too large`);
+          }
           controller.enqueue(new Uint8Array(message));
         } else if (message instanceof Uint8Array) {
           controller.enqueue(message);
@@ -400,6 +407,9 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
             .then((buffer) => {
               if (readableStreamCancel) {
                 return;
+              }
+              if (buffer.byteLength > MAX_WS_FRAME_SIZE) {
+                throw new Error(`WebSocket frame too large`);
               }
               controller.enqueue(new Uint8Array(buffer));
             })
@@ -423,7 +433,7 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
       });
 
       webSocketServer.addEventListener("error", (err) => {
-        console.error("webSocketServer has error", err);
+        console.error(`webSocketServer has error: ${err.message}`);
         controller.error(err);
       });
 
@@ -593,7 +603,7 @@ function processVlessHeader(vlessBuffer, userId) {
       for (let i = 0; i < 8; i++) {
         ipv6.push(dataView.getUint16(i * 2).toString(16));
       }
-      addressValue = `[${ipv6.join(":")}]`;
+      addressValue = ipv6.join(":");
       // seems no need add [] for ipv6
       break;
     default:
