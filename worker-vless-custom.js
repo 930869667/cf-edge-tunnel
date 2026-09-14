@@ -75,7 +75,7 @@ export default {
       return new Response("404 Not Found", { status: 404 });
     } catch (err) {
       console.error(`[服务器内部错误] fetch 流程阻断: ${err.message}`);
-      return new Response(`Internal Server Error`, { status: 500 });
+      return new Response("Bad Request", { status: 400 });
     }
   },
 };
@@ -92,7 +92,7 @@ function generateSub(cfIpList, userId, hostName) {
     .map((ip) => ip.trim())
     .map(
       (ip) =>
-        `vless://${userId}@${ip}:443?type=ws&security=tls&host=${hostName}&fp=chrome&path=%2F%3Fed%3D2048&sni=${hostName}#${encodeURIComponent("Cloudflare-" + ip)}`,
+        `vless://${userId}@${ip}:443?type=ws&security=tls&host=${encodeURIComponent(hostName)}&fp=chrome&path=%2F%3Fed%3D2048&sni=${encodeURIComponent(hostName)}#${encodeURIComponent("Cloudflare-" + ip)}`,
     );
   return btoa(lines.join("\n"));
 }
@@ -102,9 +102,6 @@ function generateSub(cfIpList, userId, hostName) {
 // =========================================================================
 async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
   // 建立双向 WebSocket 管道（client 暴露给客户端，webSocket 由 Worker 内部掌控）
-  const [client, webSocket] = Object.values(new WebSocketPair());
-
-  webSocket.accept(); // 完成 WebSocket 协议握手切换
 
   /**
    * WS 0-RTT (Early Data) 优化原理：
@@ -116,6 +113,14 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
   if (earlyDataHeader && earlyDataHeader.length > 8192) {
     throw new Error("EarlyData header too large");
   }
+
+  const pair = new WebSocketPair();
+
+  const client = pair[0];
+  const webSocket = pair[1];
+
+  webSocket.accept(); // 完成 WebSocket 协议握手切换
+
   const readableWebSocketStream = createWSReadableStream(
     webSocket,
     earlyDataHeader,
@@ -152,10 +157,7 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
           // 解包客户端发送的第一帧数据，提取并校验 UUID，并获取真正的远程连接目标 (Domain/IP:Port)
           const header = processVlessHeader(chunk, userId);
           const rawClientData = chunk.slice(header.rawDataIndex); // 截取除去 VLESS 头后的真实 payload
-          const vlessResponseHeader = new Uint8Array([
-            header.vlessVersion[0],
-            0,
-          ]); // 构造 VLESS 握手响应头
+          const vlessResponseHeader = new Uint8Array([header.vlessVersion, 0]); // 构造 VLESS 握手响应头
 
           // 校验传输层协议类型 (UDP / TCP)
           if (header.isUDP) {
@@ -591,7 +593,7 @@ function processVlessHeader(vlessBuffer, userId) {
       for (let i = 0; i < 8; i++) {
         ipv6.push(dataView.getUint16(i * 2).toString(16));
       }
-      addressValue = ipv6.join(":");
+      addressValue = `[${ipv6.join(":")}]`;
       // seems no need add [] for ipv6
       break;
     default:
