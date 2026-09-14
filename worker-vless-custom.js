@@ -75,7 +75,7 @@ export default {
       // 返回标准 404 伪装成普通不存在的静态页面，屏蔽代理节点协议特征。
       return new Response("404 Not Found", { status: 404 });
     } catch (err) {
-      console.error(`[服务器内部错误] fetch 流程阻断: ${err.message}`);
+      console.error(`[服务器内部错误] fetch 流程阻断: ${err?.message || err}`);
       return new Response("Bad Request", { status: 400 });
     }
   },
@@ -144,17 +144,37 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
           // 【分支 1】：UDP DNS 模式
           // 若之前已识别为 DNS 请求（UDP Port 53），后续所有二进制块均直接送入 DoH 处理模块
           if (isDnsMode && udpWriter) {
-            return udpWriter(chunk);
+            try {
+              return await udpWriter(chunk);
+            } catch (err) {
+              console.error(`udpWriter error ${err?.message || err}`);
+              safeCloseWebSocket(webSocket);
+              return;
+            }
           }
           // 【分支 2】：TCP 直连建立后的常态化转发
           // 当与远端服务器的 TCP 物理 Socket 已建立，后续的所有客户端 Payload 绕过 Header 解析，直接写入 Socket
           if (remoteSocketWrapper.value) {
-            if (!tcpWriter) {
-              // Acquire stream lock ONCE for the socket lifecycle
-              tcpWriter = remoteSocketWrapper.value.writable.getWriter();
+            try {
+              if (!tcpWriter) {
+                // Acquire stream lock ONCE for the socket lifecycle
+                tcpWriter = remoteSocketWrapper.value.writable.getWriter();
+              }
+              // Stream write without lock contention on every packet
+              await tcpWriter.write(chunk);
+            } catch (err) {
+              if (tcpWriter) {
+                try {
+                  tcpWriter.releaseLock();
+                } catch (_) {}
+                tcpWriter = null;
+              }
+              //写入失败时，主动打断底层 Socket 连接，防止异常挂起
+              closeRemoteSocket(remoteSocketWrapper);
+              safeCloseWebSocket(webSocket);
+              // Let pipeTo catch block handle stream termination
+              throw new Error(`tcpWriter write error: ${err.message}`);
             }
-            // Stream write without lock contention on every packet
-            await tcpWriter.write(chunk);
             return;
           }
 
@@ -196,23 +216,27 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
               vlessResponseHeader,
             );
           } catch (err) {
-            console.error(`handleTCPOutBound error: ${err.message}`);
+            console.error(`handleTCPOutBound error: ${err?.message || err}`);
+            closeRemoteSocket(remoteSocketWrapper);
             safeCloseWebSocket(webSocket);
             controller.error(err);
           }
         },
         close() {
           console.log(`readableWebSocketStream is close`);
+          closeRemoteSocket(remoteSocketWrapper);
         },
         abort(reason) {
           console.log(`readableWebSocketStream is abort, ${reason}`);
+          closeRemoteSocket(remoteSocketWrapper);
         },
       }),
     )
     .catch((err) => {
       console.error(
-        `readableWebSocketStream pipeTo has exception: ${err.message}`,
+        `readableWebSocketStream pipeTo has exception: ${err?.message || err}`,
       );
+      closeRemoteSocket(remoteSocketWrapper);
       safeCloseWebSocket(webSocket);
     });
 
@@ -252,10 +276,8 @@ async function handleTCPOutBound(
     } catch (err) {
       try {
         tcpSocket.close();
-      } catch {
-        console.error(`close tcpSocket error: ${err.message}`);
-      }
-      throw new Error(`connectAndWrite failed, ${err.message}`);
+      } catch (_) {}
+      throw new Error(`connectAndWrite failed, ${err?.message || err}`);
     } finally {
       writer.releaseLock();
     }
@@ -273,24 +295,18 @@ async function handleTCPOutBound(
     }
     // 【核心修复防泄漏】：在重新创建连接前，必须手动调用 close() 关闭此前因网络阻断挂起的直连 Socket，
     // 释放 Cloudflare 边缘节点底层 Socket 连接池句柄，防止内存与连接数暴涨。
-    if (remoteSocket.value) {
-      try {
-        remoteSocket.value.close();
-      } catch (err) {
-        console.error(`close original socket error: ${err.message}`);
-      }
-    }
+    closeRemoteSocket(remoteSocket);
     // 连接至中转 PROXY_IP
-    const tcpSocket = await connectAndWrite(proxyIp, proxyPort);
+    const proxySocket = await connectAndWrite(proxyIp, proxyPort);
     // no matter retry success or not, close websocket
-    tcpSocket.closed
+    proxySocket.closed
       .catch((err) => {
-        console.error(`retry tcpSocket closed error, ${err.message}`);
+        console.error(`retry tcpSocket closed error, ${err?.message || err}`);
       })
       .finally(() => {
         safeCloseWebSocket(webSocket);
       });
-    pipeRemoteToWS(tcpSocket, webSocket, vlessResponseHeader, null); // 重试管道不再挂载二次 retry
+    pipeRemoteToWS(proxySocket, webSocket, vlessResponseHeader, null); // 重试管道不再挂载二次 retry
   }
 
   // 优先尝试直连目标主机 (Client -> Target Server)
@@ -347,8 +363,13 @@ async function pipeRemoteToWS(
               webSocket.send(chunk);
             }
           } catch (err) {
-            controller.error(err);
+            // WS 发送失败时终止远端 Socket，防止数据堆积
+            try {
+              remoteSocket.close();
+            } catch (_) {}
             safeCloseWebSocket(webSocket);
+            controller.error(err);
+            console.error(`webSocket.send failed: ${err?.message || err}`);
           }
         },
         close() {
@@ -365,9 +386,9 @@ async function pipeRemoteToWS(
       }),
     )
     .catch((err) => {
-      console.error(`pipeRemoteToWS has exception ${err.message}`);
+      console.error(`pipeRemoteToWS has exception ${err?.message || err}`);
       safeCloseWebSocket(webSocket);
-      throw new Error(`pipeRemoteToWS has exception ${err.message}`);
+      throw new Error(`pipeRemoteToWS has exception ${err?.message || err}`);
     });
 
   // 触发重试逻辑的关键条件：连接已断开 + 从未收到过远端数据 + 挂载了重试函数
@@ -429,7 +450,7 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
       });
 
       webSocketServer.addEventListener("error", (err) => {
-        console.error(`webSocketServer has error: ${err.message}`);
+        console.error(`webSocketServer has error: ${err?.message || err}`);
         controller.error(err);
       });
 
@@ -440,7 +461,7 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
         try {
           controller.enqueue(earlyData);
         } catch (err) {
-          console.error(`enqueue earlyData error: ${err.message}`);
+          console.error(`enqueue earlyData error: ${err?.message || err}`);
         }
       }
     },
@@ -645,7 +666,7 @@ function base64ToArrayBuffer(base64Str) {
     const binary = atob(padded);
     return Uint8Array.from(binary, (c) => c.charCodeAt(0));
   } catch (err) {
-    console.error(`base64 decode error: ${err.message}`);
+    console.error(`base64 decode error: ${err?.message || err}`);
     return null; // 发生非法字符解析失败时返回 null，避免直接崩溃退出
   }
 }
@@ -668,7 +689,17 @@ function safeCloseWebSocket(socket) {
       socket.close();
     }
   } catch (err) {
-    console.error(`safeCloseWebSocket error: ${err.message}`);
+    console.error(`safeCloseWebSocket error: ${err?.message || err}`);
+  }
+}
+
+// 安全清理远端 Socket 封装
+function closeRemoteSocket(remoteSocketWrapper) {
+  if (remoteSocketWrapper && remoteSocketWrapper.value) {
+    try {
+      remoteSocketWrapper.value.close();
+    } catch (_) {}
+    remoteSocketWrapper.value = null;
   }
 }
 
@@ -845,7 +876,9 @@ async function createUDPHandler(webSocket, vlessResponseHeader) {
     )
     .catch((err) => {
       //当 Fetch 请求超时（abort）或遇到其他异常抛出时，进入此 catch
-      console.error(`createUDPHandler pipeTo has exception ${err.message}`);
+      console.error(
+        `createUDPHandler pipeTo has exception ${err?.message || err}`,
+      );
       safeCloseWebSocket(webSocket);
     });
 
