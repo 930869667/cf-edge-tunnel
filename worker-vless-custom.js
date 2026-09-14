@@ -131,6 +131,7 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
   let remoteSocketWrapper = {
     value: null,
   };
+  let tcpWriter = null;
   let udpWriter = null;
   let isDnsMode = false;
 
@@ -148,12 +149,12 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
           // 【分支 2】：TCP 直连建立后的常态化转发
           // 当与远端服务器的 TCP 物理 Socket 已建立，后续的所有客户端 Payload 绕过 Header 解析，直接写入 Socket
           if (remoteSocketWrapper.value) {
-            const writer = remoteSocketWrapper.value.writable.getWriter();
-            try {
-              await writer.write(chunk);
-            } finally {
-              writer.releaseLock(); // 极其重要：必须及时释放 Stream 锁，防止下一步管道锁死
+            if (!tcpWriter) {
+              // Acquire stream lock ONCE for the socket lifecycle
+              tcpWriter = remoteSocketWrapper.value.writable.getWriter();
             }
+            // Stream write without lock contention on every packet
+            await tcpWriter.write(chunk);
             return;
           }
 
@@ -259,7 +260,6 @@ async function handleTCPOutBound(
       writer.releaseLock();
     }
     remoteSocket.value = tcpSocket;
-
     return tcpSocket;
   }
 
@@ -532,12 +532,12 @@ function processVlessHeader(vlessBuffer, userId) {
   if (buffer.byteLength < portIndex + 2) {
     throw new Error("invalid data: port out of range");
   }
-  const portBuffer = buffer.slice(portIndex, portIndex + 2);
+
   // port is big-Endian in raw data
   const portRemote = new DataView(
-    portBuffer.buffer,
-    portBuffer.byteOffset,
-    portBuffer.byteLength,
+    buffer.buffer,
+    buffer.byteOffset + portIndex,
+    2,
   ).getUint16(0);
 
   // 5. 提取并解析目标地址
@@ -732,7 +732,7 @@ async function createUDPHandler(webSocket, vlessResponseHeader) {
       // 循环解析符合 [Length (2B)] + [Data (Length B)] 结构的包
       while (offset + 2 <= nextBuffer.length) {
         const udpPacketLength =
-          (nextBuffer[offset] << 8) | nextBuffer[offset + 1];
+          ((nextBuffer[offset] << 8) | nextBuffer[offset + 1]) >>> 0; // Use unsigned right shift (>>> 0)
         const packetEnd = offset + 2 + udpPacketLength;
         // 当前 chunk 还不足一个完整 UDP packet
         if (packetEnd > nextBuffer.byteLength) {
