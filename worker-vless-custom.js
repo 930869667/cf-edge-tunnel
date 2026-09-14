@@ -8,11 +8,6 @@ import { connect } from "cloudflare:sockets";
 const WS_READY_STATE_OPEN = 1;
 
 const ALLOWED_UDP_PORTS = new Set([53]);
-// 在并发较高的环境下，频繁对单 IP 发起 DoH 请求容易遭遇 Cloudflare Rate Limit 限制
-const DOH_ENDPOINTS = [
-  "https://1.1.1.1/dns-query",
-  "https://dns.google/dns-query",
-];
 
 const byteToHex = [];
 for (let i = 0; i < 256; ++i) {
@@ -277,15 +272,22 @@ async function handleTCPOutBound(
     });
 
     const writer = tcpSocket.writable.getWriter();
+    // Wrap write in a Promise.race timeout
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("TCP connection/write timeout")), 3000),
+    );
     try {
-      await writer.write(rawClientData); // 写入首包数据（通常是 TLS Client Hello 或 HTTP 请求）
+      // 写入首包数据（通常是 TLS Client Hello 或 HTTP 请求）
+      await Promise.race([writer.write(rawClientData), timeoutPromise]);
     } catch (err) {
       try {
         tcpSocket.close();
       } catch (_) {}
       throw new Error(`connectAndWrite failed, ${err?.message || err}`);
     } finally {
-      writer.releaseLock();
+      try {
+        writer.releaseLock();
+      } catch (_) {}
     }
     remoteSocket.value = tcpSocket;
     return tcpSocket;
@@ -304,14 +306,6 @@ async function handleTCPOutBound(
     closeRemoteSocket(remoteSocket);
     // 连接至中转 PROXY_IP
     const proxySocket = await connectAndWrite(proxyIp, proxyPort);
-    // no matter retry success or not, close websocket
-    proxySocket.closed
-      .catch((err) => {
-        console.error(`retry tcpSocket closed error, ${err?.message || err}`);
-      })
-      .finally(() => {
-        safeCloseWebSocket(webSocket);
-      });
     pipeRemoteToWS(proxySocket, webSocket, vlessResponseHeader, null); // 重试管道不再挂载二次 retry
   }
 
@@ -347,6 +341,8 @@ async function pipeRemoteToWS(
           // remoteChunkCount++;
           if (webSocket.readyState !== WS_READY_STATE_OPEN) {
             safeCloseWebSocket(webSocket);
+            // Cancel readable stream immediately so pipeTo resolves and finishes
+            remoteSocket.readable.cancel("WebSocket closed").catch((_) => {});
             controller.error("webSocket.readyState is not open, maybe close");
             return;
           }
@@ -451,13 +447,23 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
       webSocketServer.addEventListener("close", () => {
         // client send close, need close server
         // if stream is cancel, skip controller.close
+        console.log(`webSocketServer close`);
         safeCloseWebSocket(webSocketServer);
-        controller.close();
+        try {
+          controller.close();
+        } catch (_) {
+          // 忽略已经被取消的 controller 抛错
+        }
       });
 
       webSocketServer.addEventListener("error", (err) => {
         console.error(`webSocketServer has error: ${err?.message || err}`);
-        controller.error(err);
+        safeCloseWebSocket(webSocketServer);
+        try {
+          controller.error(err);
+        } catch (_) {
+          // 忽略已经被取消的 controller 抛错
+        }
       });
 
       // 提取并注入 WS 0-RTT EarlyData 首包
@@ -703,8 +709,15 @@ function safeCloseWebSocket(socket) {
 // 安全清理远端 Socket 封装
 function closeRemoteSocket(remoteSocketWrapper) {
   if (remoteSocketWrapper && remoteSocketWrapper.value) {
+    const socket = remoteSocketWrapper.value;
     try {
-      remoteSocketWrapper.value.close();
+      if (socket.readable && !socket.readable.locked) {
+        socket.readable.cancel("Closing remote socket").catch((_) => {});
+      }
+      if (socket.writable && !socket.writable.locked) {
+        socket.writable.abort("Closing remote socket").catch((_) => {});
+      }
+      socket.close();
     } catch (_) {}
     remoteSocketWrapper.value = null;
   }
@@ -809,9 +822,7 @@ async function createUDPHandler(webSocket, vlessResponseHeader) {
 
           try {
             // 通过 HTTP/2 POST 将纯二进制 DNS 报文推送到 Cloudflare 官方 DoH 接口 (1.1.1.1)
-            const dohUrl =
-              DOH_ENDPOINTS[Math.floor(Math.random() * DOH_ENDPOINTS.length)];
-            const resp = await fetch(dohUrl, {
+            const resp = await fetch("https://one.one.one.one/dns-query", {
               method: "POST",
               headers: {
                 "content-type": "application/dns-message",
