@@ -172,7 +172,7 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
               vlessResponseHeader,
             );
             udpWriter = udpHandler.write;
-            udpWriter(rawClientData); // 发送首包中包含的 DNS 查询请求
+            await udpWriter(rawClientData); // 发送首包中包含的 DNS 查询请求
             return;
           }
 
@@ -712,35 +712,43 @@ async function createUDPHandler(webSocket, vlessResponseHeader) {
   const transformStream = new TransformStream({
     start(controller) {},
     transform(chunk, controller) {
-      const nextBuffer = concatUint8Arrays([
-        pendingUdpData,
-        new Uint8Array(chunk),
-      ]);
+      const incoming = new Uint8Array(chunk);
+
+      // 如果之前有半包，先拼起来
+      const nextBuffer =
+        pendingUdpData.byteLength > 0
+          ? concatUint8Arrays([pendingUdpData, incoming])
+          : incoming;
+
       let offset = 0;
       // 循环解析符合 [Length (2B)] + [Data (Length B)] 结构的包
       while (offset + 2 <= nextBuffer.length) {
-        const udpPacketLength = new DataView(
-          nextBuffer.buffer,
-          nextBuffer.byteOffset + offset,
-          2,
-        ).getUint16(0);
-        const totalPacketSize = 2 + udpPacketLength;
-        // 若当前 buffer 剩余长度不足一个完整包，结束本次解析，留到下一个 chunk
-        if (offset + totalPacketSize > nextBuffer.length) {
-          pendingUdpData = nextBuffer.slice(offset);
-          return;
+        const udpPacketLength =
+          (nextBuffer[offset] << 8) | nextBuffer[offset + 1];
+        const packetEnd = offset + 2 + udpPacketLength;
+        // 当前 chunk 还不足一个完整 UDP packet
+        if (packetEnd > nextBuffer.byteLength) {
+          break;
         }
-        const udpData = nextBuffer.slice(offset + 2, offset + totalPacketSize);
+        const udpData = nextBuffer.slice(offset + 2, packetEnd);
         controller.enqueue(udpData);
-        offset += totalPacketSize;
+        offset = packetEnd;
       }
-      if (offset < nextBuffer.length) {
+      // 保存剩余半包
+      if (offset < nextBuffer.byteLength) {
         pendingUdpData = nextBuffer.slice(offset);
       } else {
         pendingUdpData = new Uint8Array(0);
       }
     },
-    flush(controller) {},
+    flush(controller) {
+      // 如果最后还残留数据，说明 UDP frame 不完整
+      if (pendingUdpData.byteLength > 0) {
+        throw new Error(
+          `incomplete UDP packet, remaining bytes: ${pendingUdpData.byteLength}`,
+        );
+      }
+    },
   });
 
   // 消费切分好的 DNS 报文，转换为 DNS Over HTTPS (DoH) HTTP/2 请求
@@ -752,7 +760,7 @@ async function createUDPHandler(webSocket, vlessResponseHeader) {
           const timeoutId = setTimeout(() => {
             abortController.abort("dns query timeout");
           }, 5000); // 设置 5 秒 DNS 请求超时 limit
-          let dnsQueryResult;
+
           try {
             // 通过 HTTP/2 POST 将纯二进制 DNS 报文推送到 Cloudflare 官方 DoH 接口 (1.1.1.1)
             const resp = await fetch("https://1.1.1.1/dns-query", {
@@ -766,48 +774,63 @@ async function createUDPHandler(webSocket, vlessResponseHeader) {
             if (!resp.ok) {
               throw new Error(`DNS query failed with status ${resp.status}`);
             }
-            dnsQueryResult = await resp.arrayBuffer();
+            const dnsResponseBuffer = await resp.arrayBuffer();
+            const dnsResponse = new Uint8Array(dnsResponseBuffer);
+            const udpSize = dnsResponse.byteLength;
+
+            // 重新组装 VLESS UDP 返回帧格式：[2 字节 UDP 长度] + [DNS 回应 Payload]
+            // UDP length field is 2 bytes, so maximum is 65535
+            if (udpSize > 65535) {
+              throw new Error(`DNS response too large: ${udpSize}`);
+            }
+            if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+              return;
+            }
+            /**
+             * VLESS UDP response:
+             *
+             * First response:
+             *
+             * [VLESS response header]
+             * [2 bytes UDP length]
+             * [DNS response]
+             *
+             * Subsequent responses:
+             *
+             * [2 bytes UDP length]
+             * [DNS response]
+             */
+
+            const vlessHeader = isVlessHeaderSent
+              ? null
+              : new Uint8Array(vlessResponseHeader);
+
+            const headerLength = vlessHeader?.byteLength ?? 0;
+
+            const response = new Uint8Array(
+              headerLength + 2 + dnsResponse.byteLength,
+            );
+
+            let offset = 0;
+            // VLESS response header
+            if (vlessHeader) {
+              response.set(vlessHeader, offset);
+              offset += vlessHeader.byteLength;
+            }
+
+            // UDP packet length - Big Endian
+            response[offset++] = (udpSize >> 8) & 0xff;
+            response[offset++] = udpSize & 0xff;
+            // DNS response payload
+            response.set(dnsResponse, offset);
+
+            webSocket.send(response);
+
+            isVlessHeaderSent = true;
+
+            console.log(`DoH success, DNS response length=${udpSize}`);
           } finally {
             clearTimeout(timeoutId); // 释放定时器句柄，防止内存泄露
-          }
-
-          // 重新组装 VLESS UDP 返回帧格式：[2 字节 UDP 长度] + [DNS 回应 Payload]
-          // UDP length field is 2 bytes, so maximum is 65535
-          if (dnsQueryResult.byteLength > 65535) {
-            throw new Error(
-              `DNS response too large: ${dnsQueryResult.byteLength}`,
-            );
-          }
-
-          const dnsResponse = new Uint8Array(dnsQueryResult);
-          const udpSize = dnsResponse.byteLength;
-
-          const udpSizeBuffer = new Uint8Array([
-            (udpSize >> 8) & 0xff,
-            udpSize & 0xff,
-          ]);
-          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-            return;
-          }
-
-          console.log(`doh success and dns message length is ${udpSize}`);
-          try {
-            const responseParts = [];
-            // VLESS response header is sent only once.
-            if (!isVlessHeaderSent) {
-              responseParts.push(vlessResponseHeader);
-            }
-            // VLESS UDP response: // [2 bytes UDP length] + [UDP payload]
-            responseParts.push(udpSizeBuffer, dnsResponse);
-            const response = concatUint8Arrays(responseParts);
-            webSocket.send(response.buffer);
-            isVlessHeaderSent = true;
-          } catch (err) {
-            console.error(`createUDPHandler send to ws error: ${err.message}`);
-            safeCloseWebSocket(webSocket);
-            throw new Error(
-              `createUDPHandler send to ws error: ${err.message}`,
-            );
           }
         },
       }),
