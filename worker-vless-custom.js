@@ -191,7 +191,7 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
             // 目前 UDP 代理仅支持 53 端口的 DNS 报文转发（转换为 DoH）
             if (!ALLOWED_UDP_PORTS.has(header.portRemote)) {
               throw new Error(
-                `UDP proxy is strictly disabled except for DNS with port ${ALLOWED_UDP_PORTS}`,
+                `UDP proxy is strictly disabled except for DNS with port ${Array.from(ALLOWED_UDP_PORTS).join(", ")}`,
               );
             }
             isDnsMode = true;
@@ -304,9 +304,15 @@ async function handleTCPOutBound(
     // 【核心修复防泄漏】：在重新创建连接前，必须手动调用 close() 关闭此前因网络阻断挂起的直连 Socket，
     // 释放 Cloudflare 边缘节点底层 Socket 连接池句柄，防止内存与连接数暴涨。
     closeRemoteSocket(remoteSocket);
-    // 连接至中转 PROXY_IP
-    const proxySocket = await connectAndWrite(proxyIp, proxyPort);
-    pipeRemoteToWS(proxySocket, webSocket, vlessResponseHeader, null); // 重试管道不再挂载二次 retry
+
+    try {
+      // 连接至中转 PROXY_IP
+      const proxySocket = await connectAndWrite(proxyIp, proxyPort);
+      pipeRemoteToWS(proxySocket, webSocket, vlessResponseHeader, null); // 重试管道不再挂载二次 retry
+    } catch (err) {
+      console.error(`Fallback proxy connection failed: ${err?.message || err}`);
+      safeCloseWebSocket(webSocket);
+    }
   }
 
   // 优先尝试直连目标主机 (Client -> Target Server)
@@ -677,7 +683,12 @@ function base64ToArrayBuffer(base64Str) {
     const normalized = base64Str.replace(/-/g, "+").replace(/_/g, "/");
     const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
     const binary = atob(padded);
-    return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    // Allocate fixed buffer & fill directly (prevents GC spikes)
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
   } catch (err) {
     console.error(`base64 decode error: ${err?.message || err}`);
     return null; // 发生非法字符解析失败时返回 null，避免直接崩溃退出
