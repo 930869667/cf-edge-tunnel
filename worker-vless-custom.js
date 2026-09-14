@@ -8,6 +8,11 @@ import { connect } from "cloudflare:sockets";
 const WS_READY_STATE_OPEN = 1;
 
 const ALLOWED_UDP_PORTS = new Set([53]);
+// 在并发较高的环境下，频繁对单 IP 发起 DoH 请求容易遭遇 Cloudflare Rate Limit 限制
+const DOH_ENDPOINTS = [
+  "https://1.1.1.1/dns-query",
+  "https://dns.google/dns-query",
+];
 
 const byteToHex = [];
 for (let i = 0; i < 256; ++i) {
@@ -91,6 +96,7 @@ function generateSub(cfIpList, userId, hostName) {
   const lines = cfIpList
     .split(",")
     .map((ip) => ip.trim())
+    .filter((ip) => ip.length > 0) // 过滤空 IP 项
     .map(
       (ip) =>
         `vless://${userId}@${ip}:443?type=ws&security=tls&host=${encodeURIComponent(hostName)}&fp=chrome&path=%2F%3Fed%3D2048&sni=${encodeURIComponent(hostName)}#${encodeURIComponent("Cloudflare-" + ip)}`,
@@ -456,7 +462,7 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
 
       // 提取并注入 WS 0-RTT EarlyData 首包
       const earlyData = base64ToArrayBuffer(earlyDataHeader);
-      if (earlyData) {
+      if (earlyData && earlyData.byteLength > 0) {
         // enqueue 尽量保障捕获异常
         try {
           controller.enqueue(earlyData);
@@ -618,7 +624,8 @@ function processVlessHeader(vlessBuffer, userId) {
       // 2001:0db8:85a3:0000:0000:8a2e:0370:7334
       const ipv6 = [];
       for (let i = 0; i < 8; i++) {
-        ipv6.push(dataView.getUint16(i * 2).toString(16));
+        // 显式指定Big-Endian (false)
+        ipv6.push(dataView.getUint16(i * 2, false).toString(16));
       }
       addressValue = ipv6.join(":");
       // seems no need add [] for ipv6
@@ -802,7 +809,9 @@ async function createUDPHandler(webSocket, vlessResponseHeader) {
 
           try {
             // 通过 HTTP/2 POST 将纯二进制 DNS 报文推送到 Cloudflare 官方 DoH 接口 (1.1.1.1)
-            const resp = await fetch("https://1.1.1.1/dns-query", {
+            const dohUrl =
+              DOH_ENDPOINTS[Math.floor(Math.random() * DOH_ENDPOINTS.length)];
+            const resp = await fetch(dohUrl, {
               method: "POST",
               headers: {
                 "content-type": "application/dns-message",
