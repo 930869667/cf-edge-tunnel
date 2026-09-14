@@ -41,7 +41,8 @@ export default {
       const upgradeHeader = request.headers.get("Upgrade") || null;
       const url = new URL(request.url);
       // 去掉尾部斜杠，方便比较路由是否一致
-      const normalizedPath = url.pathname.replace(/\/+$/, "");
+      const normalizedPath =
+        url.pathname === "/" ? "/" : url.pathname.replace(/\/+$/, "");
 
       // 1.1 动态节点订阅下发 (匹配暗号路径: /{UUID}/vE4pQ9xN2k)
       // 原理：客户端（如 v2rayN, Shadowrocket）通过 GET 请求拉取配置，服务端动态组合优选 IP 列表下发
@@ -112,7 +113,9 @@ async function handleVlessOverWS(request, userId, proxyIp, proxyPort = 443) {
    * 以 Base64 形式直接带上 VLESS 首包数据，从而省去 1 个 RTT 延时。
    */
   const earlyDataHeader = request.headers.get("sec-websocket-protocol") || null;
-
+  if (earlyDataHeader && earlyDataHeader.length > 8192) {
+    throw new Error("EarlyData header too large");
+  }
   const readableWebSocketStream = createWSReadableStream(
     webSocket,
     earlyDataHeader,
@@ -413,9 +416,6 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
       // 提取并注入 WS 0-RTT EarlyData 首包
       const earlyData = base64ToArrayBuffer(earlyDataHeader);
       if (earlyData) {
-        if (earlyData.byteLength > 4 * 1024) {
-          throw new Error("earlyDataHeader is too large, max 4KB");
-        }
         // enqueue 尽量保障捕获异常
         try {
           controller.enqueue(earlyData);
@@ -426,7 +426,7 @@ function createWSReadableStream(webSocketServer, earlyDataHeader) {
     },
 
     pull(controller) {
-      // if ws can stop read if stream is full, we can implement backpressure
+      // Streams API provides downstream backpressure, but WebSocket event source itself cannot be paused directly.
       // https://streams.spec.whatwg.org/#example-rs-push-backpressure
     },
     cancel(reason) {
@@ -476,7 +476,7 @@ function processVlessHeader(vlessBuffer, userId) {
   if (buffer.byteLength < 24) {
     throw new Error("invalid data: buffer length is less than 24 bytes");
   }
-  // 1. 协议版本 (Version)
+  // 1. 协议版本 (Version), 不需要校验
   const version = buffer[0];
 
   // 2. 身份校验 (1-16 字节为 UUID)
@@ -486,6 +486,9 @@ function processVlessHeader(vlessBuffer, userId) {
 
   // 3. 动态偏移量计算 (跳过附加选项 Opt)
   const optLength = buffer[17];
+  if (18 + optLength > buffer.byteLength) {
+    throw new Error("invalid data: option length out of range");
+  }
 
   // 3. 读取传输指令类型 (0x01 TCP, 0x02 UDP)
   const commandIndex = 18 + optLength;
@@ -510,7 +513,7 @@ function processVlessHeader(vlessBuffer, userId) {
     throw new Error("invalid data: port out of range");
   }
   const portBuffer = buffer.slice(portIndex, portIndex + 2);
-  // port is big-Endian in raw data etc 80 == 0x005d
+  // port is big-Endian in raw data
   const portRemote = new DataView(
     portBuffer.buffer,
     portBuffer.byteOffset,
@@ -553,7 +556,8 @@ function processVlessHeader(vlessBuffer, userId) {
       if (buffer.byteLength < addressValueIndex + addressLength) {
         throw new Error("invalid data: domain address out of range");
       }
-      addressValue = new TextDecoder().decode(
+      const decoder = new TextDecoder("utf-8");
+      addressValue = decoder.decode(
         buffer.slice(addressValueIndex, addressValueIndex + addressLength),
       );
       break;
@@ -613,8 +617,9 @@ function concatUint8Arrays(arrays) {
 function base64ToArrayBuffer(base64Str) {
   if (!base64Str) return null;
   try {
-    // go use modified Base64 for URL rfc4648 which js atob not support
-    const binary = atob(base64Str.replace(/-/g, "+").replace(/_/g, "/"));
+    const normalized = base64Str.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    const binary = atob(padded);
     return Uint8Array.from(binary, (c) => c.charCodeAt(0));
   } catch (err) {
     console.error(`base64 decode error: ${err.message}`);
@@ -805,22 +810,19 @@ async function createUDPHandler(webSocket, vlessResponseHeader) {
       //当 Fetch 请求超时（abort）或遇到其他异常抛出时，进入此 catch
       console.error(`createUDPHandler pipeTo has exception ${err.message}`);
       safeCloseWebSocket(webSocket);
-
-      // 【核心修复防挂起】：当 DNS Fetch 请求超时或中断时，抛出异常会被此处 catch。
-      // 必须主动调用 writer.abort() 结束流，否则 TransformStream 的上游 Writer 将永久处于 Locked 挂起状态。
-      // 增加此处的修复：主动释放/中断 writer，防止 TransformStream 管道挂起
-      try {
-        writer.abort(err);
-      } catch (err) {
-        // 忽略已关闭的 writer 报错
-      }
     });
 
   const writer = transformStream.writable.getWriter();
 
   return {
     write(chunk) {
-      writer.write(chunk);
+      return writer.write(chunk);
+    },
+    close() {
+      return writer.close();
+    },
+    abort(reason) {
+      return writer.abort(reason);
     },
   };
 }
